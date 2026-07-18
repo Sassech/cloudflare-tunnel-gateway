@@ -1,0 +1,53 @@
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:1826-d2a87e9b9345
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+    networks:
+      - cloudflared-network
+    mem_limit: 64m
+    cpus: 0.25
+    cpuset: "0"
+    cpu_shares: 128
+    labels:
+      - "com.cloudflared.role=gateway"
+      - "com.cloudflared.managed_by=terraform"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  cf-watcher:
+    build: ./cf-watcher
+    container_name: cf-watcher
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 32m
+    cpus: 0.1
+    group_add:
+      - "${DOCKER_GID}"  # non-root access to docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - cloudflared-network
+    env_file: .env
+    depends_on:
+      - cloudflared
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  cloudflared-network:
+    name: cloudflared-network
+    driver: bridge

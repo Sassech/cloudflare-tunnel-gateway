@@ -1,0 +1,7 @@
+# Environment — contains real API tokens and secrets
+.env
+
+# OpenCode / AI tooling
+.atl/
+cf-watcher/old/
+
