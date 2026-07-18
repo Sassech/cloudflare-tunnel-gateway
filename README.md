@@ -32,17 +32,18 @@ Paste the output into `CLOUDFLARED_TOKEN` in `.env`.
 ### Cloudflare API token
 
 Create a token at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) with these permissions:
+
 - **Account > Cloudflare Tunnel > Edit**
 - **Zone > DNS > Edit** (only if you use `cf.dns=true`)
 
 ### IDs
 
-| Variable | Where to find it |
-|---|---|
-| `CF_ACCOUNT_ID` | Dashboard > right sidebar > Account ID |
-| `CF_TUNNEL_ID` | ID of your tunnel (the UUID) |
-| `CF_ZONE_ID` | Dashboard > your domain > Overview > Zone ID (right sidebar) — only if using `cf.dns=true` |
-| `DOCKER_GID` | `getent group docker \| cut -d: -f3` on the host |
+| Variable        | Where to find it                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------ |
+| `CF_ACCOUNT_ID` | Dashboard > right sidebar > Account ID                                                     |
+| `CF_TUNNEL_ID`  | ID of your tunnel (the UUID)                                                               |
+| `CF_ZONE_ID`    | Dashboard > your domain > Overview > Zone ID (right sidebar) — only if using `cf.dns=true` |
+| `DOCKER_GID`    | `getent group docker \| cut -d: -f3` on the host                                           |
 
 ## Exposing a service
 
@@ -57,17 +58,17 @@ services:
     labels:
       cf.hostname: "app.yourdomain.com"
       cf.port: "8080"
-      cf.dns: "true"  # optional: auto-create DNS CNAME
+      cf.dns: "true" # optional: auto-create DNS CNAME
 ```
 
 ### Label reference
 
-| Label | Required | Description |
-|---|---|---|
-| `cf.hostname` | yes | Public FQDN to expose |
-| `cf.port` | yes | Internal container port (1-65535) |
-| `cf.service` | no | `http` (default) or `https` |
-| `cf.dns` | no | `true` to auto-create a proxied CNAME via Cloudflare DNS (requires `CF_ZONE_ID`) |
+| Label         | Required | Description                                                                      |
+| ------------- | -------- | -------------------------------------------------------------------------------- |
+| `cf.hostname` | yes      | Public FQDN to expose                                                            |
+| `cf.port`     | yes      | Internal container port (1-65535)                                                |
+| `cf.service`  | no       | `http` (default) or `https`                                                      |
+| `cf.dns`      | no       | `true` to auto-create a proxied CNAME via Cloudflare DNS (requires `CF_ZONE_ID`) |
 
 ### Connecting external Compose files
 
@@ -96,11 +97,3 @@ Docker daemon ──► cf-watcher ──► Cloudflare API ──► tunnel con
 ```
 
 DNS CNAMEs are created/deleted per-container only for services with `cf.dns=true`. Records created outside cf-watcher are never deleted.
-
-## Rollback (from Go to Python)
-
-If the Go version has issues:
-
-1. `docker compose stop cf-watcher`
-2. Restore `cf-watcher/old/*.py` + `cf-watcher/old/Dockerfile.old` to `cf-watcher/` root
-3. `docker compose build cf-watcher && docker compose up -d cf-watcher`
