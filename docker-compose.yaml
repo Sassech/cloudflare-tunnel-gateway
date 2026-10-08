@@ -3,7 +3,15 @@ services:
     image: cloudflare/cloudflared:1826-d2a87e9b9345
     container_name: cloudflared
     restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+    # The connector token is provisioned by cf-watcher (one tunnel per host)
+    # and written to the shared volume below — no CLOUDFLARED_TOKEN needed.
+    command: tunnel --no-autoupdate run --token-file /run/cloudflared/token
+    volumes:
+      - cloudflared-token:/run/cloudflared:ro
+    depends_on:
+      cf-watcher:
+        # cf-watcher reports healthy only after the token file is written.
+        condition: service_healthy
     networks:
       - cloudflared-network
     mem_limit: 64m
@@ -24,6 +32,11 @@ services:
     container_name: cf-watcher
     restart: unless-stopped
     read_only: true
+    # Share the host's UTS namespace so the default tunnel name
+    # (cf-watcher-<hostname>) is the VPS hostname, stable across container
+    # recreation — not the random container ID. Safe: all capabilities are
+    # dropped, so the container cannot change the host's hostname.
+    uts: host
     tmpfs:
       - /tmp
     security_opt:
@@ -36,16 +49,28 @@ services:
       - "${DOCKER_GID}"  # non-root access to docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Writable even with read_only: true; ownership comes from the image's
+      # /run/cloudflared (1000:65532, 0750) on the volume's first mount.
+      - cloudflared-token:/run/cloudflared
     networks:
       - cloudflared-network
     env_file: .env
-    depends_on:
-      - cloudflared
+    healthcheck:
+      # Inherits the image's HEALTHCHECK command. Probe every 2s while
+      # starting so cloudflared (waiting on service_healthy) starts as soon
+      # as the token is written, instead of after the 30s steady-state
+      # interval. start_interval requires Docker Engine >= 25.
+      interval: 30s
+      start_period: 60s
+      start_interval: 2s
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  cloudflared-token:
 
 networks:
   cloudflared-network:

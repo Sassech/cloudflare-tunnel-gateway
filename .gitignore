@@ -5,3 +5,10 @@
 .atl/
 cf-watcher/old/
 
+# SonarQube scan artifacts
+cf-watcher/coverage.out
+cf-watcher/.scannerwork/
+
+# IA
+.claude/
+.opencode/
