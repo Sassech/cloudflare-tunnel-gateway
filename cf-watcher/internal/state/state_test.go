@@ -93,9 +93,23 @@ func TestStore_BuildIngress_CatchAllAlwaysLast_MultipleEntries(t *testing.T) {
 	}
 }
 
+func TestStore_Clear(t *testing.T) {
+	s := NewStore()
+	s.Add(Entry{ContainerID: "c1", ContainerName: "app", Hostname: "app.vantus.site", Port: 8080, Service: "http"})
+	s.Add(Entry{ContainerID: "c2", ContainerName: "warden", Hostname: "warden.vantus.site", Port: 80, Service: "https"})
+
+	s.Clear()
+
+	got := s.BuildIngress()
+	want := []map[string]any{
+		{"service": "http_status:404"},
+	}
+	assertIngressEqual(t, got, want)
+}
+
 func TestStore_DNSEntries(t *testing.T) {
-	// REQ-5.1/REQ-5.5: only entries with DNS=true must be returned, used by
-	// the startup CF_ZONE_ID guard and the sync loop's DNS diff.
+	// Only entries with DNS=true must be returned, used by the startup
+	// CF_ZONE_ID guard and the sync loop's DNS diff.
 	s := NewStore()
 	s.Add(Entry{ContainerID: "c1", ContainerName: "app", Hostname: "app.vantus.site", Port: 8080, Service: "http", DNS: false})
 	s.Add(Entry{ContainerID: "c2", ContainerName: "warden", Hostname: "warden.vantus.site", Port: 80, Service: "https", DNS: true})

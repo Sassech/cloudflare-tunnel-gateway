@@ -45,6 +45,17 @@ func (s *Store) Remove(containerID string) {
 	delete(s.entries, containerID)
 }
 
+// Clear removes all tracked entries, resetting the store to empty. Used by
+// POST /reload to fully resync state from the live Docker daemon,
+// discarding any entry that no longer corresponds to a currently running
+// container (e.g. one that lost its cf.* labels without a stop/start
+// event).
+func (s *Store) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = make(map[string]Entry)
+}
+
 // DNSEntries returns a snapshot of all currently tracked entries with
 // DNS=true (cf.dns=true label) — the set of hostnames that require a
 // managed Cloudflare CNAME record. Order is unspecified.

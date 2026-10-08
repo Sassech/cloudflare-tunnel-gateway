@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/docker/docker/api/types"
@@ -11,7 +12,7 @@ import (
 )
 
 // fakeDockerClient is a minimal in-memory implementation of
-// watcher.DockerClient for tests — no real Docker daemon connection (FR-9).
+// watcher.DockerClient for tests — no real Docker daemon connection.
 type fakeDockerClient struct {
 	containers []types.Container
 
@@ -57,25 +58,100 @@ func (f *fakeDockerClient) ContainerInspect(_ context.Context, containerID strin
 	return types.ContainerJSON{}, nil
 }
 
-// fakeTunnelClient is a minimal in-memory implementation of TunnelClient.
+// fakeTunnelClient is a minimal in-memory implementation of TunnelManager
+// (TunnelClient + TunnelProvisioner).
 type fakeTunnelClient struct {
 	mu sync.Mutex
 
-	configSrc string // "cloudflare" (default) or "local" to simulate SC-10
+	configSrc string // "cloudflare" (default) or "local" to simulate remote config assertion failure
 
 	assertCalls int
 	putCalls    int
 	lastIngress []map[string]any
+
+	// Provisioning.
+	tunnels     map[string]string // name -> ID of live tunnels in the "account"
+	ensureErr   error
+	ensureCalls int
+	createCalls int
+	tunnelID    string // set via SetTunnelID
+	token       string // returned by GetTunnelToken
+	tokenErr    error
+	// tokenGate, if non-nil, blocks GetTunnelToken until it is closed —
+	// lets tests observe the system mid-provisioning.
+	tokenGate chan struct{}
+	// calls records the order of tunnel API calls, for ordering asserts.
+	calls []string
 }
 
 func newFakeTunnelClient() *fakeTunnelClient {
-	return &fakeTunnelClient{configSrc: "cloudflare"}
+	return &fakeTunnelClient{
+		configSrc: "cloudflare",
+		tunnels:   make(map[string]string),
+		token:     "fake-connector-token",
+	}
+}
+
+func (f *fakeTunnelClient) EnsureTunnel(_ context.Context, name string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureCalls++
+	f.calls = append(f.calls, "EnsureTunnel")
+	if f.ensureErr != nil {
+		return "", false, f.ensureErr
+	}
+	if id, ok := f.tunnels[name]; ok {
+		return id, false, nil
+	}
+	f.createCalls++
+	id := "created-" + name
+	f.tunnels[name] = id
+	return id, true, nil
+}
+
+func (f *fakeTunnelClient) GetTunnelToken(ctx context.Context, tunnelID string) (string, error) {
+	f.mu.Lock()
+	gate := f.tokenGate
+	f.calls = append(f.calls, "GetTunnelToken")
+	f.mu.Unlock()
+
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tokenErr != nil {
+		return "", f.tokenErr
+	}
+	if tunnelID == "" {
+		return "", errors.New("fake: empty tunnel ID")
+	}
+	return f.token, nil
+}
+
+func (f *fakeTunnelClient) SetTunnelID(tunnelID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "SetTunnelID")
+	f.tunnelID = tunnelID
+}
+
+func (f *fakeTunnelClient) callLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
 }
 
 func (f *fakeTunnelClient) AssertConfigSrc(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.assertCalls++
+	f.calls = append(f.calls, "AssertConfigSrc")
 	if f.configSrc != "cloudflare" {
 		return errFakeLocalConfigSrc
 	}
@@ -86,6 +162,7 @@ func (f *fakeTunnelClient) PutTunnelConfig(_ context.Context, ingress []map[stri
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.putCalls++
+	f.calls = append(f.calls, "PutTunnelConfig")
 	f.lastIngress = ingress
 	return nil
 }
@@ -96,22 +173,35 @@ func (f *fakeTunnelClient) snapshot() (assertCalls, putCalls int, lastIngress []
 	return f.assertCalls, f.putCalls, f.lastIngress
 }
 
-// fakeDNSSyncer is a minimal in-memory implementation of DNSSyncer.
+// fakeDNSSyncer is a minimal in-memory implementation of DNSSyncer. tracked
+// doubles as the simulated Cloudflare backend's full set of CNAME records
+// for the tunnel — tests can pre-populate it directly to simulate records
+// left over from a previous process session (orphans).
 type fakeDNSSyncer struct {
 	mu      sync.Mutex
 	tracked map[string]string
 
 	createCalls int
 	deleteCalls int
+
+	// tunnelIDs records every tunnel ID passed to CreateCNAME and
+	// ListManagedRecords, to assert the resolved ID is used.
+	tunnelIDs []string
 }
 
 func newFakeDNSSyncer() *fakeDNSSyncer {
 	return &fakeDNSSyncer{tracked: make(map[string]string)}
 }
 
-func (f *fakeDNSSyncer) CreateCNAME(_ context.Context, hostname, _ string) (string, error) {
+func (f *fakeDNSSyncer) CreateCNAME(_ context.Context, hostname, tunnelID string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.tunnelIDs = append(f.tunnelIDs, tunnelID)
+	if existing, ok := f.tracked[hostname]; ok {
+		// Mirrors dns.Client.CreateCNAME: already tracked (created this
+		// session or adopted) — idempotent no-op, no new API call.
+		return existing, nil
+	}
 	f.createCalls++
 	id := "rec-" + hostname
 	f.tracked[hostname] = id
@@ -136,7 +226,30 @@ func (f *fakeDNSSyncer) TrackedHostnames() map[string]string {
 	return snapshot
 }
 
-// errFakeLocalConfigSrc simulates SC-10 (tunnel in local config mode).
+func (f *fakeDNSSyncer) ListManagedRecords(_ context.Context, tunnelID string) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tunnelIDs = append(f.tunnelIDs, tunnelID)
+	snapshot := make(map[string]string, len(f.tracked))
+	for k, v := range f.tracked {
+		snapshot[k] = v
+	}
+	return snapshot, nil
+}
+
+func (f *fakeDNSSyncer) seenTunnelIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.tunnelIDs...)
+}
+
+func (f *fakeDNSSyncer) AdoptRecord(hostname, recordID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tracked[hostname] = recordID
+}
+
+// errFakeLocalConfigSrc simulates the tunnel being in local config mode.
 type fakeLocalConfigSrcError struct{}
 
 func (fakeLocalConfigSrcError) Error() string {

@@ -12,7 +12,6 @@ package watcher
 
 import (
 	"context"
-	"log"
 	"strconv"
 	"strings"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/network"
 
+	"cf-watcher/internal/logging"
 	"cf-watcher/internal/state"
 )
 
@@ -74,7 +74,7 @@ func ExtractDesiredState(containerID, containerName string, labels map[string]st
 	// cf.port must be a valid integer 1-65535.
 	port, err := strconv.Atoi(portRaw)
 	if err != nil || port < portMin || port > portMax {
-		log.Printf("WARNING: container %s: cf.port=%q is not a valid port (1-65535) — skipping", containerName, portRaw)
+		logging.Warningf("container %s: cf.port=%q is not a valid port (1-65535) — skipping", containerName, portRaw)
 		return nil, false
 	}
 
@@ -86,7 +86,7 @@ func ExtractDesiredState(containerID, containerName string, labels map[string]st
 	case "http", "https":
 		// valid as-is
 	default:
-		log.Printf("WARNING: container %s: cf.service=%q is not a valid value (expected http/https) — falling back to %q", containerName, service, defaultService)
+		logging.Warningf("container %s: cf.service=%q is not a valid value (expected http/https) — falling back to %q", containerName, service, defaultService)
 		service = defaultService
 	}
 
@@ -112,6 +112,6 @@ func CheckNetworkMembership(containerName, dockerNetwork string, networks map[st
 		return
 	}
 	if _, ok := networks[dockerNetwork]; !ok {
-		log.Printf("WARNING: container %s is not on network %s — tunnel may not reach it", containerName, dockerNetwork)
+		logging.Warningf("container %s is not on network %s — tunnel may not reach it", containerName, dockerNetwork)
 	}
 }

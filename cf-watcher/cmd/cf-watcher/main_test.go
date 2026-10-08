@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -19,9 +20,9 @@ func TestRun_StartupReconcileFailure_ReturnsErrorWithoutStartingWatch(t *testing
 	cf := newFakeTunnelClient()
 	cf.configSrc = "local" // forces AssertConfigSrc to fail (SC-10)
 	dnsClient := newFakeDNSSyncer()
-	cfg := testConfig()
+	cfg := runTestConfig(t)
 
-	err := run(context.Background(), cfg, docker, cf, dnsClient)
+	err := run(context.Background(), cfg, docker, cf, dnsClient, nil)
 	if err == nil {
 		t.Fatal("run() error = nil, want error (startup reconcile must fail)")
 	}
@@ -36,14 +37,14 @@ func TestRun_LiveStartEvent_TriggersDebouncedSync(t *testing.T) {
 	cf := newFakeTunnelClient()
 	dnsClient := newFakeDNSSyncer()
 
-	cfg := testConfig()
+	cfg := runTestConfig(t)
 	cfg.DebounceSeconds = 0.05 // short window for a fast test
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	runErrCh := make(chan error, 1)
 	go func() {
-		runErrCh <- run(ctx, cfg, docker, cf, dnsClient)
+		runErrCh <- run(ctx, cfg, docker, cf, dnsClient, nil)
 	}()
 
 	// Wait for the startup reconcile PUT (0 containers → catch-all only)
@@ -101,6 +102,80 @@ func TestRun_LiveStartEvent_TriggersDebouncedSync(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("run() did not return after ctx cancellation")
 	}
+}
+
+// TestRun_HealthServerWiring is an end-to-end test of the full
+// main() → run() → startHealthServer() wiring: with a real HealthAddr (not
+// "off"), /healthz and /metrics must actually respond over HTTP while
+// run() is active, and the listener must be gone (graceful shutdown) once
+// ctx is canceled and run() returns.
+func TestRun_HealthServerWiring(t *testing.T) {
+	const addr = "127.0.0.1:18099" // fixed port, only this test binds it
+
+	docker := newFakeDockerClient(nil)
+	cf := newFakeTunnelClient()
+	dnsClient := newFakeDNSSyncer()
+
+	cfg := runTestConfig(t)
+	cfg.HealthAddr = addr
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- run(ctx, cfg, docker, cf, dnsClient, nil)
+	}()
+
+	var healthzResp *http.Response
+	waitForCondition(t, 2*time.Second, func() bool {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err != nil {
+			return false
+		}
+		healthzResp = resp
+		return true
+	})
+	healthzResp.Body.Close()
+	if healthzResp.StatusCode != http.StatusOK {
+		t.Errorf("GET /healthz status = %d, want 200", healthzResp.StatusCode)
+	}
+
+	metricsResp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics error = %v", err)
+	}
+	metricsResp.Body.Close()
+	if metricsResp.StatusCode != http.StatusOK {
+		t.Errorf("GET /metrics status = %d, want 200", metricsResp.StatusCode)
+	}
+
+	// /reload is disabled (404) because cfg.ReloadToken is unset — confirms
+	// the same mux serves all three routes, not just /healthz.
+	reloadResp, err := http.Post("http://"+addr+"/reload", "", nil)
+	if err != nil {
+		t.Fatalf("POST /reload error = %v", err)
+	}
+	reloadResp.Body.Close()
+	if reloadResp.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /reload status = %d, want 404 (RELOAD_TOKEN unset)", reloadResp.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-runErrCh:
+		if err != nil {
+			t.Fatalf("run() error = %v, want nil after ctx cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run() did not return after ctx cancellation")
+	}
+
+	// The health server must have shut down along with run() — a new
+	// request must fail to connect, not hang or succeed.
+	waitForCondition(t, 2*time.Second, func() bool {
+		_, err := http.Get("http://" + addr + "/healthz")
+		return err != nil
+	})
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, cond func() bool) {

@@ -2,12 +2,12 @@ package watcher
 
 import (
 	"context"
-	"log"
 	"time"
 
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 
+	"cf-watcher/internal/logging"
 	"cf-watcher/internal/state"
 )
 
@@ -71,7 +71,7 @@ func handleEvent(ctx context.Context, docker DockerClient, store *state.Store, d
 	case events.ActionStop, events.ActionDie, events.ActionKill:
 		// Remove from state, mark dirty.
 		store.Remove(containerID)
-		log.Printf("INFO: container %s (%s) — removed from desired state", containerName, msg.Action)
+		logging.Infof("container %s (%s) — removed from desired state", containerName, msg.Action)
 		signalDirty(dirty)
 	}
 }
@@ -83,7 +83,7 @@ func handleEvent(ctx context.Context, docker DockerClient, store *state.Store, d
 func handleStart(ctx context.Context, docker DockerClient, store *state.Store, dockerNetwork string, containerID, containerName string, dirty chan<- struct{}) {
 	inspect, err := docker.ContainerInspect(ctx, containerID)
 	if err != nil {
-		log.Printf("WARNING: container %s: inspect failed on start event — skipping: %v", containerName, err)
+		logging.Warningf("container %s: inspect failed on start event — skipping: %v", containerName, err)
 		return
 	}
 
@@ -104,8 +104,8 @@ func handleStart(ctx context.Context, docker DockerClient, store *state.Store, d
 	}
 
 	store.Add(*entry)
-	log.Printf(
-		"INFO: container %s started — added ingress rule hostname=%s port=%d service=%s dns=%t",
+	logging.Infof(
+		"container %s started — added ingress rule hostname=%s port=%d service=%s dns=%t",
 		containerName, entry.Hostname, entry.Port, entry.Service, entry.DNS,
 	)
 	signalDirty(dirty)

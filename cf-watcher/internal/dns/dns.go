@@ -4,12 +4,8 @@
 package dns
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"sync"
@@ -17,6 +13,7 @@ import (
 
 	"cf-watcher/internal/cfapi"
 	"cf-watcher/internal/config"
+	"cf-watcher/internal/logging"
 )
 
 // defaultBaseURL is the production Cloudflare API base URL.
@@ -35,8 +32,8 @@ type Client struct {
 	mu sync.Mutex
 	// tracked maps hostname -> record_id for CNAME records created by
 	// cf-watcher in this process session. Only records present here may be
-// deleted — this is what makes create/delete idempotent and prevents
-// cf-watcher from touching DNS records it did not create.
+	// deleted — this is what makes create/delete idempotent and prevents
+	// cf-watcher from touching DNS records it did not create.
 	tracked map[string]string
 }
 
@@ -97,7 +94,7 @@ func (c *Client) CreateCNAME(ctx context.Context, hostname, tunnelID string) (re
 	if found {
 		// Record exists but cf-watcher did not create it this session —
 		// skip creation, do not adopt it into session tracking.
-		log.Printf("WARNING: DNS record for %s already exists (record_id=%s) and was not created by cf-watcher — skipping", hostname, existingID)
+		logging.Warningf("DNS record for %s already exists (record_id=%s) and was not created by cf-watcher — skipping", hostname, existingID)
 		return "", nil
 	}
 
@@ -123,7 +120,7 @@ func (c *Client) CreateCNAME(ctx context.Context, hostname, tunnelID string) (re
 	c.tracked[hostname] = resp.Result.ID
 	c.mu.Unlock()
 
-	log.Printf("INFO: CNAME created hostname=%s record_id=%s target=%s.cfargotunnel.com", hostname, resp.Result.ID, tunnelID)
+	logging.Infof("CNAME created hostname=%s record_id=%s target=%s.cfargotunnel.com", hostname, resp.Result.ID, tunnelID)
 	return resp.Result.ID, nil
 }
 
@@ -141,6 +138,49 @@ func (c *Client) TrackedHostnames() map[string]string {
 	return snapshot
 }
 
+// AdoptRecord registers an existing CNAME record — created by a previous
+// cf-watcher process session, or discovered via ListManagedRecords — into
+// this session's tracked-records map, without making an API call. Once
+// adopted, DeleteCNAME can remove it and CreateCNAME treats it as already
+// existing (skipping creation).
+func (c *Client) AdoptRecord(hostname, recordID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tracked[hostname] = recordID
+}
+
+// ListManagedRecords returns every CNAME record in the zone whose content
+// points at "{tunnelID}.cfargotunnel.com" — i.e. every DNS record currently
+// routed through this Cloudflare Tunnel, regardless of which cf-watcher
+// process session created it.
+//
+// This is used at startup to recover records left behind by a previous
+// process: since tracked always starts empty on restart, without this
+// cf-watcher would never notice (and never clean up) a CNAME whose
+// container was removed while cf-watcher was not running.
+//
+// GET /zones/{zone_id}/dns_records?type=CNAME&content={tunnelID}.cfargotunnel.com
+func (c *Client) ListManagedRecords(ctx context.Context, tunnelID string) (map[string]string, error) {
+	target := fmt.Sprintf("%s.cfargotunnel.com", tunnelID)
+	path := fmt.Sprintf("/zones/%s/dns_records?type=CNAME&content=%s", c.zoneID, url.QueryEscape(target))
+
+	var resp struct {
+		Result []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"result"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+
+	records := make(map[string]string, len(resp.Result))
+	for _, r := range resp.Result {
+		records[r.Name] = r.ID
+	}
+	return records, nil
+}
+
 // DeleteCNAME deletes the CNAME record for hostname, but ONLY if it is
 // currently tracked in this session's managed-records map — cf-watcher
 // must never delete a DNS record it did not create. If hostname
@@ -150,7 +190,7 @@ func (c *Client) DeleteCNAME(ctx context.Context, hostname string) error {
 	recordID, ok := c.tracked[hostname]
 	c.mu.Unlock()
 	if !ok {
-		log.Printf("DEBUG: %s not managed by cf-watcher, skipping DNS delete", hostname)
+		logging.Debugf("%s not managed by cf-watcher, skipping DNS delete", hostname)
 		return nil
 	}
 
@@ -165,56 +205,16 @@ func (c *Client) DeleteCNAME(ctx context.Context, hostname string) error {
 	delete(c.tracked, hostname)
 	c.mu.Unlock()
 
-	log.Printf("INFO: CNAME deleted hostname=%s record_id=%s", hostname, recordID)
+	logging.Infof("CNAME deleted hostname=%s record_id=%s", hostname, recordID)
 	return nil
 }
 
 // doJSON performs a JSON HTTP request against the Cloudflare API with
-// retry/backoff (cfapi.WithRetry — shared policy with internal/cfapi),
+// retry/backoff (cfapi.DoJSON — shared policy with internal/cfapi),
 // decoding the response body into out (if non-nil).
 //
 // Error handling mirrors internal/cfapi: network errors and 5xx
 // responses are retried; 4xx responses are returned immediately.
 func (c *Client) doJSON(ctx context.Context, method, path string, body, out any) error {
-	return cfapi.WithRetry(ctx, func() error {
-		var reqBody io.Reader
-		if body != nil {
-			b, err := json.Marshal(body)
-			if err != nil {
-				return fmt.Errorf("dns: failed to encode request body for %s %s: %w", method, path, err)
-			}
-			reqBody = bytes.NewReader(b)
-		}
-
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
-		if err != nil {
-			return fmt.Errorf("dns: failed to build request for %s %s: %w", method, path, err)
-		}
-		req.Header.Set("Authorization", "Bearer "+c.apiToken)
-		if body != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return cfapi.Retryable(fmt.Errorf("dns: %s %s: %w", method, path, err))
-		}
-		defer resp.Body.Close()
-
-		respBody, _ := io.ReadAll(resp.Body)
-
-		if resp.StatusCode >= 500 {
-			return cfapi.Retryable(fmt.Errorf("dns: %s %s returned %d: %s", method, path, resp.StatusCode, respBody))
-		}
-		if resp.StatusCode >= 400 {
-			return fmt.Errorf("dns: %s %s returned %d: %s", method, path, resp.StatusCode, respBody)
-		}
-
-		if out != nil && len(respBody) > 0 {
-			if err := json.Unmarshal(respBody, out); err != nil {
-				return fmt.Errorf("dns: failed to decode response from %s %s: %w", method, path, err)
-			}
-		}
-		return nil
-	})
+	return cfapi.NewJSONClient(c.httpClient, c.baseURL, c.apiToken, "dns").Do(ctx, method, path, body, out)
 }
