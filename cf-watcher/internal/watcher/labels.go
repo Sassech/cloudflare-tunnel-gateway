@@ -7,6 +7,8 @@
 //	cf.hostname  — required — non-empty string, e.g. "app.example.com"
 //	cf.port      — required — integer string, 1-65535
 //	cf.service   — optional — "http" (default) or "https"
+//	cf.origin    — optional — origin host override; shared Docker network
+//	               alias for replicas (default: container name)
 //	cf.dns       — optional — "true" / "false" (default "false")
 package watcher
 
@@ -43,6 +45,7 @@ const (
 	labelHostname = "cf.hostname"
 	labelPort     = "cf.port"
 	labelService  = "cf.service"
+	labelOrigin   = "cf.origin"
 	labelDNS      = "cf.dns"
 
 	defaultService = "http"
@@ -90,6 +93,11 @@ func ExtractDesiredState(containerID, containerName string, labels map[string]st
 		service = defaultService
 	}
 
+	// cf.origin is an optional origin host override (shared Docker network
+	// alias for replicas). Blank means unset — BuildIngress falls back to the
+	// container name.
+	origin := strings.TrimSpace(labels[labelOrigin])
+
 	// cf.dns defaults to "false".
 	dns := strings.ToLower(strings.TrimSpace(labels[labelDNS])) == "true"
 
@@ -99,6 +107,7 @@ func ExtractDesiredState(containerID, containerName string, labels map[string]st
 		Hostname:      hostname,
 		Port:          port,
 		Service:       service,
+		Origin:        origin,
 		DNS:           dns,
 	}, true
 }

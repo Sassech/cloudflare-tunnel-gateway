@@ -93,6 +93,75 @@ func TestStore_BuildIngress_CatchAllAlwaysLast_MultipleEntries(t *testing.T) {
 	}
 }
 
+func TestStore_BuildIngress_CollapsesReplicasSharingHostname(t *testing.T) {
+	// Two replicas sharing a hostname AND a shared origin (cf.origin alias)
+	// collapse into exactly ONE ingress rule pointing at the shared origin, so
+	// Docker's embedded DNS round-robins across them. Cloudflare Tunnel ingress
+	// is one-rule-per-hostname; duplicate rules would be dead.
+	s := NewStore()
+	s.Add(Entry{ContainerID: "c1", ContainerName: "web-1", Hostname: "app.vantus.site", Port: 8080, Service: "http", Origin: "web"})
+	s.Add(Entry{ContainerID: "c2", ContainerName: "web-2", Hostname: "app.vantus.site", Port: 8080, Service: "http", Origin: "web"})
+
+	got := s.BuildIngress()
+
+	want := []map[string]any{
+		{"hostname": "app.vantus.site", "service": "http://web:8080"},
+		{"service": "http_status:404"},
+	}
+	assertIngressEqual(t, got, want)
+}
+
+func TestStore_BuildIngress_OriginOverridesContainerName(t *testing.T) {
+	// A single entry with cf.origin set routes to the override host, not the
+	// container name.
+	s := NewStore()
+	s.Add(Entry{ContainerID: "c1", ContainerName: "web-1", Hostname: "app.vantus.site", Port: 8080, Service: "http", Origin: "web"})
+
+	got := s.BuildIngress()
+
+	want := []map[string]any{
+		{"hostname": "app.vantus.site", "service": "http://web:8080"},
+		{"service": "http_status:404"},
+	}
+	assertIngressEqual(t, got, want)
+}
+
+func TestStore_BuildIngress_ConflictingOriginsDeterministic(t *testing.T) {
+	// Same hostname, DIFFERENT origins (a misconfiguration — replicas should
+	// share a cf.origin). BuildIngress must still emit exactly ONE rule, chosen
+	// deterministically (lexicographically smallest service URL), never
+	// duplicate dead rules nor a random-map-order "last wins".
+	s := NewStore()
+	s.Add(Entry{ContainerID: "c1", ContainerName: "zeta", Hostname: "app.vantus.site", Port: 8080, Service: "http"})
+	s.Add(Entry{ContainerID: "c2", ContainerName: "alpha", Hostname: "app.vantus.site", Port: 8080, Service: "http"})
+
+	got := s.BuildIngress()
+
+	// "http://alpha:8080" < "http://zeta:8080"
+	want := []map[string]any{
+		{"hostname": "app.vantus.site", "service": "http://alpha:8080"},
+		{"service": "http_status:404"},
+	}
+	assertIngressEqual(t, got, want)
+}
+
+func TestStore_BuildIngress_DeterministicHostnameOrder(t *testing.T) {
+	// Distinct hostnames produce one rule each in sorted hostname order, with
+	// the catch-all always last — output must not depend on map iteration order.
+	s := NewStore()
+	s.Add(Entry{ContainerID: "c1", ContainerName: "zeta", Hostname: "zeta.vantus.site", Port: 80, Service: "http"})
+	s.Add(Entry{ContainerID: "c2", ContainerName: "alpha", Hostname: "alpha.vantus.site", Port: 80, Service: "http"})
+
+	got := s.BuildIngress()
+
+	want := []map[string]any{
+		{"hostname": "alpha.vantus.site", "service": "http://alpha:80"},
+		{"hostname": "zeta.vantus.site", "service": "http://zeta:80"},
+		{"service": "http_status:404"},
+	}
+	assertIngressEqual(t, got, want)
+}
+
 func TestStore_Clear(t *testing.T) {
 	s := NewStore()
 	s.Add(Entry{ContainerID: "c1", ContainerName: "app", Hostname: "app.vantus.site", Port: 8080, Service: "http"})

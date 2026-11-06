@@ -148,6 +148,45 @@ func TestExtractDesiredState(t *testing.T) {
 			},
 			wantOK: true,
 		},
+		{
+			// cf.origin names the shared Docker network alias used as the
+			// ingress origin host, overriding the container name — the hook
+			// that lets replicas sharing a hostname collapse to one origin.
+			name: "cf.origin set — overrides origin host",
+			labels: map[string]string{
+				"cf.hostname": "app.vantus.site",
+				"cf.port":     "8080",
+				"cf.origin":   "web",
+			},
+			want: &state.Entry{
+				ContainerID:   "c1",
+				ContainerName: "app",
+				Hostname:      "app.vantus.site",
+				Port:          8080,
+				Service:       "http",
+				Origin:        "web",
+			},
+			wantOK: true,
+		},
+		{
+			// Blank cf.origin is treated as unset — Origin stays empty and
+			// BuildIngress falls back to the container name.
+			name: "cf.origin blank — not set",
+			labels: map[string]string{
+				"cf.hostname": "app.vantus.site",
+				"cf.port":     "8080",
+				"cf.origin":   "   ",
+			},
+			want: &state.Entry{
+				ContainerID:   "c1",
+				ContainerName: "app",
+				Hostname:      "app.vantus.site",
+				Port:          8080,
+				Service:       "http",
+				Origin:        "",
+			},
+			wantOK: true,
+		},
 	}
 
 	for _, tt := range tests {

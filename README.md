@@ -111,7 +111,37 @@ services:
 | `cf.hostname` | yes      | Public FQDN to expose                                                            |
 | `cf.port`     | yes      | Internal container port (1-65535)                                                |
 | `cf.service`  | no       | `http` (default) or `https`                                                      |
+| `cf.origin`   | no       | Origin host override — a shared Docker network alias (default: container name). See [Load balancing replicas](#load-balancing-replicas) |
 | `cf.dns`      | no       | `true` to auto-create a proxied CNAME via Cloudflare DNS (requires `CF_ZONE_ID`) |
+
+### Load balancing replicas
+
+Cloudflare Tunnel ingress is **one rule per hostname** — it does not round-robin
+multiple origins (`originRequest` is per-rule connection config, not load
+balancing). To balance traffic across replicas of a service, put them behind a
+**shared Docker network alias** and point every replica's `cf.origin` at that
+alias. cf-watcher then emits a single ingress rule for the hostname, and
+Docker's embedded DNS round-robins across the replica containers.
+
+```yaml
+services:
+  web:
+    image: myapp:latest
+    deploy:
+      replicas: 3
+    networks:
+      cloudflared-network:
+        aliases:
+          - web-lb # shared alias all 3 replicas answer to
+    labels:
+      cf.hostname: "app.yourdomain.com"
+      cf.port: "8080"
+      cf.origin: "web-lb" # route the hostname at the shared alias, not one container
+```
+
+If two containers share a `cf.hostname` but resolve to **different** origins,
+cf-watcher still emits a single rule (choosing deterministically) and logs a
+WARNING — configure a shared `cf.origin` to silence it.
 
 ### Connecting external Compose files
 
